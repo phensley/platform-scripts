@@ -1,0 +1,238 @@
+#!/usr/bin/env python
+
+'''
+quick platform.sh daily backup script
+ - backs up database and files from multiple projects / environments
+ - uses rsync and hard-links for efficient file backups
+ - mutual exclusion with an flock
+ - sends email to multiple recipients when an exception occurs
+'''
+
+import argparse, atexit, fcntl, os, shutil, smtplib, sys, traceback, yaml
+from datetime import datetime
+from subprocess import Popen, PIPE
+
+E_RUN = 'failed to execute command %r'
+E_KEY = 'you must specify %r in the config file.'
+
+TEMPNAME = '_backup_in_progress_'
+PLATFORM_CMD = None
+
+# default location to search
+DEFAULT_PLATFORM_BIN = os.path.expanduser('~/.platformsh/bin/platform')
+
+def info(m):
+    sys.stderr.write(m + '\n')
+    sys.stderr.flush()
+
+def fail(m):
+    info(m)
+    raise Exception(m)
+
+def today():
+    return datetime.now().strftime('%Y%m%d')
+
+def joiner(sep, *keys):
+    return sep.join(keys)
+
+def makedirs(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+def run_platform(token, args):
+    env = os.environ.copy()
+    env['PLATFORMSH_CLI_TOKEN'] = token
+    cmd = [PLATFORM_CMD] + args
+    proc = Popen(cmd, env=env, stdout=PIPE)
+    out, err = proc.communicate()
+    if proc.returncode:
+        cmd = ' '.join(cmd)
+        fail(E_RUN % cmd)
+    return out
+
+def run(cmd):
+    proc = Popen(cmd, stdout=PIPE)
+    out, err = proc.communicate()
+    if proc.returncode:
+        cmd = ' '.join(cmd)
+        fail(E_RUN % cmd)
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('-c', '--config', required=True,
+        help='Configuration file (YAML)')
+    p.add_argument('-t', '--test', action='store_true',
+        help='Send a test email')
+    return p.parse_args()
+
+def require(cfg, *keys):
+    for k in keys:
+        if cfg.get(k) is None:
+            fail(E_KEY % k)
+
+def load(args):
+    global PLATFORM_CMD
+
+    cfg = yaml.load(open(args.config, 'rb'))
+    cfg['config'] = os.path.abspath(args.config)
+
+    # locate executable
+    binpath = cfg.get('platform_bin', DEFAULT_PLATFORM_BIN)
+    if not os.access(binpath, os.X_OK):
+        fail('cannot execute %r' % binpath)
+    PLATFORM_CMD = binpath
+
+    # check configuration
+    projects = cfg.get('projects', [])
+    if not projects:
+        fail('you must define at least one project')
+    for p in projects:
+        require(p, 'root', 'project', 'token', 'environment', 'identity')
+        p['root'] = os.path.abspath(p.get('root', '.'))
+
+    # validate at least one email address exists
+    emails = cfg.get('emails')
+    if emails is None:
+        fail("no 'emails' defined for error reporting.")
+    return cfg
+
+def process(cfg):
+    names = (cfg['project'], cfg['environment'])
+    root = os.path.join(cfg['root'], *names)
+    temp = os.path.join(root, TEMPNAME)
+    makedirs(root)
+
+    if os.path.exists(temp):
+        info('removing previous incomplete backup.')
+        shutil.rmtree(temp)
+
+    dayname = 'daily_' + today()
+    curr = os.path.join(root, dayname)
+    if os.path.exists(curr):
+        info('removing previous same-day backup.')
+        shutil.rmtree(curr)
+
+    # check if a prior snapshot exists. we will clone it using hard links
+    # to reduce storage for N backups.
+    snaps = [d for d in os.listdir(root) if d.startswith('daily_')]
+    snaps.sort()
+    if snaps:
+        info('hard-linking %s to %s' % (snaps[-1], dayname))
+        src = os.path.join(root, snaps[-1])
+        run(['cp', '-la', src, temp])
+    else:
+        makedirs(temp)
+
+    # get platform cli token
+    token = cfg['token']
+
+    # archive the database
+    dbroot = os.path.join(temp, 'database')
+    makedirs(dbroot)
+    dbpath = os.path.join(dbroot, 'platform-%s-%s.sql.gz' % names) 
+    dbcmd = [
+        'db:dump', '--yes', 
+        '-p', names[0], 
+        '-e', names[1], 
+        '-i', cfg['identity'], 
+        '-z', '-f', dbpath
+    ]
+    run_platform(token, dbcmd)
+
+    # get ssh info for this environment
+    host = run_platform(token, ['ssh', '--pipe', '-p', names[0], '-e', names[1]])
+
+    # create files root and synchronize all file paths
+    filesroot = os.path.join(temp, 'files')
+    makedirs(filesroot)
+    for _file in cfg['files']:
+        filepath = '%s:%s' % (host, _file)
+        cmd = [
+            'rsync', '-arzR', 
+            '--numeric-ids', '--delete', 
+            '--timeout=120', 
+            '-e', 'ssh -i %s' % cfg['identity'],
+            filepath,
+            filesroot
+        ]
+        info('rsync: %s' % filepath)
+        run(cmd)
+    
+    # move temporary directory into place.
+    os.rename(temp, curr)
+
+    # prune old backups
+    keep = cfg.get('keep', 7)
+    snaps = [d for d in os.listdir(root) if d.startswith('daily_')]
+    snaps.sort()
+    for snap in snaps[:-keep]:
+        path = os.path.join(root, snap)
+        shutil.rmtree(path)
+
+MAILHEAD = '''\
+From: %s
+Subject: platform-backup %s
+To: %s
+'''
+
+MAILBODY = '''
+platform-backup %s started at %s encountered an error:
+
+%s
+'''
+
+def sendmail(cfg, now, msg):
+    # report an error over email
+    rcpts = ', '.join(cfg['emails'])
+    fromaddr = 'root@localhost'
+    head = MAILHEAD % (fromaddr, cfg['config'], rcpts)
+    body = MAILBODY % (cfg['config'], now, msg)
+    conn = smtplib.SMTP('127.0.0.1', 25)
+    conn.helo('localhost')
+    conn.sendmail(fromaddr, rcpts, head + body)
+    conn.close()
+
+class Locker(object):
+
+    # mutual exclusion for backup runs
+
+    def __init__(self, path):
+        self.path = path
+        self.lockpath = '%s.lock' % path
+        self.fh = None
+
+    def lock(self):
+        try:
+            self.fh = open(self.lockpath, 'w')
+            fcntl.lockf(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError, e:
+            fail('platform-backup %r is already running.' % self.path)
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        if os.path.exists(self.lockpath):
+            self.fh.close()
+            os.unlink(self.lockpath)
+
+def main():
+    args = parse_args()
+    cfg = load(args)
+    now = datetime.now().isoformat()
+
+    if args.test:
+        sendmail(cfg, now, 'Testing platform-backup email')
+        return
+
+    try:
+        locker = Locker(os.path.abspath(args.config))
+        locker.lock()
+        for project in cfg['projects']:
+            process(project)
+    except Exception, ex:
+        tb = traceback.format_exc()
+        sendmail(cfg, now, tb)
+        info('fatal error: %s' % tb)
+
+if __name__ == '__main__':
+    main()
+

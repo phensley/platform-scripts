@@ -1,0 +1,17 @@
+---
+
+platform_cmd: /root/.platformsh/bin/platform
+
+emails:
+ - user@example.com
+
+projects:
+ - root: /data/platform/backups
+   project: abcdefghijkl
+   token: abcdefghijkl
+   keep: 7
+   environment: production
+   identity: /root/platform-backup-key
+   files:
+    - /app/abcdefghijkl/sites/default/files
+
