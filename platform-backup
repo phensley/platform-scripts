@@ -43,19 +43,23 @@ def run_platform(token, args):
     env = os.environ.copy()
     env['PLATFORMSH_CLI_TOKEN'] = token
     cmd = [PLATFORM_CMD] + args
-    proc = Popen(cmd, env=env, stdout=PIPE)
+    proc = Popen(cmd, env=env, stdout=PIPE, stderr=PIPE)
     out, err = proc.communicate()
+    proc.wait()
     if proc.returncode:
         cmd = ' '.join(cmd)
         fail(E_RUN % cmd)
+    info(err)
     return out
 
 def run(cmd):
-    proc = Popen(cmd, stdout=PIPE)
+    proc = Popen(cmd, stdout=PIPE, stderr=PIPE)
     out, err = proc.communicate()
+    proc.wait()
     if proc.returncode:
         cmd = ' '.join(cmd)
         fail(E_RUN % cmd)
+    info(err)
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -230,6 +234,7 @@ def main():
         locker.lock()
         for project in cfg['projects']:
             process(project)
+        info('backup complete.')
     except Exception, ex:
         tb = traceback.format_exc()
         sendmail(cfg, now, tb)
