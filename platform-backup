@@ -108,16 +108,13 @@ def process(cfg):
 
     dayname = 'daily_' + today()
     curr = os.path.join(root, dayname)
-    if os.path.exists(curr):
-        info('removing previous same-day backup.')
-        shutil.rmtree(curr)
 
     # check if a prior snapshot exists. we will clone it using hard links
     # to reduce storage for N backups.
     snaps = [d for d in os.listdir(root) if d.startswith('daily_')]
     snaps.sort()
     if snaps:
-        info('hard-linking %s to %s' % (snaps[-1], dayname))
+        info('hard-linking %s to %s' % (snaps[-1], temp))
         src = os.path.join(root, snaps[-1])
         run(['cp', '-la', src, temp])
     else:
@@ -157,6 +154,10 @@ def process(cfg):
         ]
         info('rsync: %s' % filepath)
         run(cmd)
+
+    if os.path.exists(curr):
+        info('removing previous same-day backup.')
+        shutil.rmtree(curr)
     
     # move temporary directory into place.
     os.rename(temp, curr)
@@ -167,6 +168,7 @@ def process(cfg):
     snaps.sort()
     for snap in snaps[:-keep]:
         path = os.path.join(root, snap)
+        info('pruning old backup %r' % snap)
         shutil.rmtree(path)
 
 MAILHEAD = '''\
