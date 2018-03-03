@@ -7,5 +7,5 @@
 * Uses rsync and hard links to only copy daily file changes
 * Keeps N days of backups
 * Mutual exclusion to avoid overlapping backup runs
-* Emails multple recipients when an exception occurs
+* Emails multiple recipients when an exception occurs
 
