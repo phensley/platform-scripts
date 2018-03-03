@@ -102,7 +102,7 @@ def load(args):
 
 def process(cfg):
     names = (cfg['project'], cfg['environment'])
-    root = os.path.join(cfg['root'], *names)
+    root = os.path.join(cfg['root'], '_'.join(names))
     temp = os.path.join(root, TEMPNAME)
     makedirs(root)
 
@@ -130,7 +130,7 @@ def process(cfg):
     # archive the database
     dbroot = os.path.join(temp, 'database')
     makedirs(dbroot)
-    dbpath = os.path.join(dbroot, 'platform-%s-%s.sql.gz' % names) 
+    dbpath = os.path.join(dbroot, 'platform-%s_%s.sql.gz' % names) 
     dbcmd = [
         'db:dump', '--yes', 
         '-p', names[0], 
@@ -141,7 +141,7 @@ def process(cfg):
     run_platform(token, dbcmd)
 
     # get ssh info for this environment
-    host = run_platform(token, ['ssh', '--pipe', '-p', names[0], '-e', names[1]])
+    host = run_platform(token, ['ssh', '-n', '--pipe', '-p', names[0], '-e', names[1]])
 
     # create files root and synchronize all file paths
     filesroot = os.path.join(temp, 'files')
